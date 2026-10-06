@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "逐风铁旅",
+    "slug": "storm-caravan",
+    "version": "1.0.0",
+    "orientation": "landscape",
+    "scheme": "stormcaravan",
+    "userInterfaceStyle": "dark",
+    "updates": { "enabled": false },
+    "android": {
+      "package": "com.stormcaravan.game",
+      "versionCode": 1,
+      "permissions": [],
+      "blockedPermissions": ["android.permission.INTERNET", "android.permission.ACCESS_NETWORK_STATE", "android.permission.SYSTEM_ALERT_WINDOW", "android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE", "android.permission.RECORD_AUDIO"]
+    },
+    "plugins": ["./plugins/with-offline-release.cjs"]
+  }
+}
