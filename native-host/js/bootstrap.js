@@ -52,13 +52,14 @@
             var player = ftc.player;
             if (!player || !player.ManagerMap || !player.ManagerTask) return;
             var topLayout = ftc.ManagerRes.topLayout();
+            if (window.Alloy2581Local && typeof window.Alloy2581Local.ensureSaveSwitcher === 'function') window.Alloy2581Local.ensureSaveSwitcher(topLayout);
             observeTalkTouches(topLayout);
             var lock = ftc.ManagerRes.lockClicking;
             console.log('[ALLOY2581_LOCAL_STATE] ' + JSON.stringify({
                 sceneLoaded: ftc.scene.isLoaded, frameLifecycleReady: ftc.scene.isLoadedFtr,
                 localGameplayStarted: player.isStartGame === true, uiGameplayStarted: ftc.ManagerData.isStartGame === true,
                 runtimeProfile: ftc.localMode.profile, originalTestMode: fts.TEST,
-                originalSte: player.ste, saveError: player.dbFile.ERROR, dslReady: player.system.isStart,
+                originalSte: player.ste, playerLevel: player.lv, saveError: player.dbFile.ERROR, dslReady: player.system.isStart,
                 activeThreads: player.system._threads.length, storeThreads: player.system.storeThreadSize,
                 map: player.ManagerMap.cur, task: player.ManagerTask.cur,
                 pendingUiRequests: ftc._sendPackMsgs && ftc._sendPackMsgs.l,

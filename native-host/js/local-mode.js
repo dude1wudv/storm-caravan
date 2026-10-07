@@ -11,6 +11,7 @@
     function localLog(storage) {
         var pending = [];
         var elapsed = 0;
+        var result;
         function add(kind, args) {
             pending.push({time: Date.now(), kind: kind, values: Array.prototype.slice.call(args)});
         }
@@ -22,11 +23,51 @@
             storage.setItem(prefix + 'logs', JSON.stringify(entries));
             pending.length = 0;
         }
-        var result = {tick: function (delta) { elapsed += delta; if (elapsed >= 5) { elapsed = 0; flush(); } }, flush: flush};
-        ['addLog', 'addDebug', 'addEventLog', 'addActivityLog', 'addActivityEndDelItemLog'].forEach(function (kind) {
+        result = {
+            _datas: pending,
+            tick: function (delta) { elapsed += delta; if (elapsed >= 5) { elapsed = 0; flush(); } },
+            flush: flush,
+            init: function () {},
+            sendLog: flush,
+            _getTime: function () { return ft.getSysSecond(); }
+        };
+        ['addLog', 'addDebug', 'addEventLog', 'addActivityLog', 'addActivityLog2', 'addActivityEndDelItemLog'].forEach(function (kind) {
             result[kind] = function () { add(kind, arguments); };
         });
         return result;
+    }
+
+    function unavailable(log, operation, args) {
+        log.addLog('service-unavailable', operation);
+        // No original server entity or response exists. Never synthesize success or rewards.
+        var response = {ok: false, status: 'not-configured', local: true, operation: operation};
+        var callback = null;
+        for (var index = 0; index < args.length; index += 1) {
+            if (typeof args[index] === 'function') { callback = args[index]; break; }
+        }
+        if (callback) window.setTimeout(function () { callback(false, JSON.stringify(response)); }, 0);
+        return response;
+    }
+
+    function ensureLocalActivityMessages(player) {
+        var manager = player && player.ManagerMsg;
+        if (!manager || typeof manager.addMsgLocal !== 'function' || typeof ftd === 'undefined' || !ftd.Msg || !ftd.Msg.data) return;
+        var supportedUi = {103: true, 109: true, 110: true, 111: true, 118: true};
+        Object.keys(ftd.Msg.data).forEach(function (id) {
+            // Online messages require the original server-supplied entity, base and ext.
+            if (ftd.Msg.get(id, 'updateType')) return;
+            var ui = ftd.Msg.get(id, 'ui');
+            var values = Array.isArray(ui) ? ui : [ui];
+            var type = ftd.Msg.get(id, 'type');
+            var isRequiredType = typeof ft !== 'undefined' && ft.type && ft.type.msg &&
+                (type === ft.type.msg.pointShop || type === ft.type.msg.vip || type === ft.type.msg.pointRate);
+            if (!isRequiredType && !values.some(function (value) { return supportedUi[Number(value)] === true; })) return;
+            try {
+                manager.addMsgLocal(Number(id));
+            } catch (error) {
+                console.error('[ALLOY2581_LOCAL_MSG_SKIP] id=' + id + ' ui=' + values.join(',') + ' ' + error.message);
+            }
+        });
     }
 
     function localHttp(player, log) {
@@ -36,23 +77,53 @@
             getDay: function () { return ft.toDay(ft.getSysSecond()); },
             getHoliday: function () { return -1; },
             tick: function () { result.lastLocalTick = ft.getSysSecond(); },
-            readyTouch: function () { result.lastLocalRollover = ft.toDay(ft.getSysSecond()); return {ok: false, status: 'not-configured'}; },
+            readyTouch: function () { ensureLocalActivityMessages(player); result.lastLocalRollover = ft.toDay(ft.getSysSecond()); return {ok: true, status: 'local', local: true}; },
             log: function (data, kind) { log.addLog('http-log', kind, data); return {ok: true, destination: 'local-log'}; }
         };
-        // All remote call sites in the pinned main bundle remain explicit unavailable boundaries.
+        // Keep remote entry points callable, but explicitly reject operations without a server implementation.
         ['init', 'setPassportInfo', 'startGameService', 'touch', 'useCDKey', 'modifyNick',
-            'useGiftMoney', 'rewardByTotalPay', 'getActivityCD', 'addMonsterroomReport',
+            'useGiftMoney', 'rewardByTotalPay', 'getActivityCD', 'getActivityCD2', 'addMonsterroomReport',
             'addRankingScore', 'addTowerRanking', 'getBattleReport', 'getMonsterroomHeros',
             'getMonsterroomHerosRandom', 'getMonsterroomInfos', 'getMonsterroomReportList',
             'getRankingList', 'getTowerRankingVal', 'postBattleReport', 'praiseMonsterroom',
             'quitMonsterroom', 'updateMonsterroom', 'updateNickToRanking'].forEach(function (operation) {
-            result[operation] = function () {
-                log.addLog('service-unavailable', operation);
-                if (ftc.scene && ftc.scene.isLoaded) ftc.showTip('本地模式未配置此远端服务：' + operation);
-                return {ok: false, status: 'not-configured', operation: operation};
-            };
+            result[operation] = function () { return unavailable(log, operation, arguments); };
         });
+        ['post', 'postLogic', '_post', 'handleTouch', 'playerMsg', '_initPreloadData',
+            'insertConnect', 'deleteConnect', '_sysAcountResult', '_setPassport'].forEach(function (operation) {
+            result[operation] = function () { return unavailable(log, operation, arguments); };
+        });
+        result.getHostUrl = function () { return ''; };
+        result.convertServiceUrl = function () { return ''; };
         return result;
+    }
+
+    function installOfflineSessionBoundary(player, log) {
+        var originalGetPlayer = player.getPlayer;
+        if (typeof originalGetPlayer === 'function') {
+            player.getPlayer = function (result, operation, text) {
+                var types = ft.type && ft.type.http;
+                var sessionOperation = types && ['GetUsrSession', 'CheckUsrSession', 'Touch'].some(function (name) {
+                    return types[name] !== undefined && operation === types[name];
+                });
+                if (result && sessionOperation && !player.dbFile.ERROR) {
+                    // Session failure is not save corruption in an unauthenticated local game.
+                    log.addLog('offline-session-unavailable', operation, result);
+                    player.send('showTip', '离线模式不连接账号服务器，此操作不可用。');
+                    return false;
+                }
+                return originalGetPlayer.apply(this, arguments);
+            };
+        }
+        player.playerExit = function (callback) {
+            // Do not invoke original HTTP touch/re-login on local lifecycle exit.
+            if (!player.dbFile.ERROR) {
+                player.dbFile.tickSave();
+                if (typeof ftc._tickLocalStorage === 'function') ftc._tickLocalStorage(1000);
+            }
+            log.flush();
+            if (typeof callback === 'function') callback();
+        };
     }
 
     function localHeader(storage) {
@@ -77,6 +148,31 @@
                     console.log('[ALLOY2581_LOCAL_SAVE_UPGRADE] preserved=' + oldSelected + ' selected=' + headers.sel + ' reason=original-core-recovered');
                     save();
                 } else if (!text) save();
+                if (window.Alloy2581FullTestSeed && !headers.fullTestSlotV2) {
+                    var fullSeedId = prefix + 'slot-' + headers.next;
+                    if (storage.getItem(fullSeedId)) throw new Error('Full test slot exists; refusing overwrite');
+                    storage.setItem(fullSeedId, '*01' + JSON.stringify(window.Alloy2581FullTestSeed));
+                    headers.next++;
+                    headers.list.push(fullSeedId);
+                    headers.sel = fullSeedId;
+                    headers.fullTestSlotV2 = fullSeedId;
+                    save();
+                    console.log('[ALLOY2581_FULL_TEST_SEED] created=' + fullSeedId);
+                }
+                if (window.Alloy2581TestLevel === 300 && !headers.level300Slot) {
+                    // Explicit test fixture using original Player.SaveKeys and DbFile *01 format.
+                    // Preserve every existing slot; never change recharge, currency or quest state.
+                    var seedId = prefix + 'slot-' + headers.next;
+                    if (storage.getItem(seedId)) throw new Error('Test seed slot already exists; refusing overwrite');
+                    storage.setItem(seedId, '*01' + JSON.stringify({syn: 1,
+                        data: {'00': {'9': 300, 'f': 0, 'a': '离线300级测试'}}, d1: {}, d2: {}, dt1: {}}));
+                    headers.next++;
+                    headers.list.push(seedId);
+                    headers.sel = seedId;
+                    headers.level300Slot = seedId;
+                    save();
+                    console.log('[ALLOY2581_LEVEL300_SEED] created=' + seedId);
+                }
                 return true;
             },
             getSelectHeader: function () { return headers.sel; },
@@ -134,6 +230,7 @@
         player.localMode = {mode: 'independent-local', profile: 'local-production', authenticated: false};
         player.http = localHttp(player, log);
         player.serverLog = log;
+        installOfflineSessionBoundary(player, log);
         player.dbHeader = localHeader(storage);
         var device = storage.getItem(prefix + 'identity');
         if (!device) {
@@ -208,6 +305,33 @@
                             }
                             Object.keys(player.ManagerKeys).forEach(function (name) { player[name].start(); });
                         }
+                        if (window.Alloy2581FullTestSeed) {
+                            var testHeader = JSON.parse(storage.getItem(prefix + 'header'));
+                            if (testHeader.fullTestSlotV2 === player.id) {
+                                // Explicit QA-only replenishment after original startup normalization.
+                                // Never applies to ordinary/previous saves or changes paid eligibility.
+                                Object.keys(player.ManagerItem.items).forEach(function (id) {
+                                    player.ManagerItem.items[id].num = 99999;
+                                });
+                                Object.keys(player.ManagerEquip.equips).forEach(function (id) {
+                                    player.ManagerEquip.equips[id].num = 60;
+                                });
+                                Object.keys(player.ManagerCore.cores).forEach(function (id) {
+                                    player.ManagerCore.cores[id].lv = 5;
+                                });
+                                player.ManagerCore.tuanDuiHeXinLv = 50;
+                                player.dbFile.tickSave();
+                                if (typeof ftc._tickLocalStorage === 'function') ftc._tickLocalStorage(1000);
+                                console.log('[ALLOY2581_FULL_TEST_READY] ' + JSON.stringify({
+                                    items: Object.keys(player.ManagerItem.items).length,
+                                    itemQuantity: 99999, equipment: Object.keys(player.ManagerEquip.equips).length,
+                                    equipmentQuantity: 60, cores: Object.keys(player.ManagerCore.cores).length,
+                                    coreLevel: 5, teamCoreLevel: player.ManagerCore.tuanDuiHeXinLv,
+                                    roles: Object.keys(player.ManagerRole.roles).length
+                                }));
+                            }
+                        }
+                        ensureLocalActivityMessages(player);
                         player._checkStart();
                         // Deliver original ck/c1/c2 from actual defineVar state before any LayoutMain reads it.
                         player.tick();
@@ -216,8 +340,12 @@
                         ftc.onLineOk = false;
                         scene.isLoaded = true;
                         scene.mainLoop = window.setInterval(function () { player.tick(); }, 0);
+                        scene.__alloySaveEnsure = window.setInterval(function () {
+                            var layout = ftc.ManagerRes.findLayout && ftc.ManagerRes.findLayout('LayoutPlayerInfo');
+                            if (layout) ensureLocalSaveSwitcher(layout);
+                        }, 1000);
                         prepareResources(scene, function () {
-                            ftc.ManagerRes.newLayout('LayoutMain', function () {
+                            ftc.ManagerRes.newLayout('LayoutMain', function (layout) {
                                 scene.nodeWait.active = false;
                                 console.log('[ALLOY2581_LOCAL_READY] ste=' + player.ste + ' managers=' + Object.keys(player.ManagerKeys).length);
                             });
@@ -228,10 +356,149 @@
         });
     }
 
-    window.Alloy2581Local = {
+    function localSaveSlots() {
+        var player = ftc.player;
+        if (!player || !player.dbHeader) return [];
+        var selected = player.dbHeader.getSelectHeader();
+        return player.dbHeader.getAllHeaders().map(function (id, index) {
+            return {id: id, index: index + 1, selected: id === selected};
+        });
+    }
+
+    function reloadLocalSave(id) {
+        var player = ftc.player;
+        if (!player || !player.dbHeader || !player.dbHeader.setSelectHeader(id)) return false;
+        if (player.dbFile && typeof player.dbFile.tickSave === 'function') player.dbFile.tickSave();
+        if (cc.director && typeof cc.director.loadScene === 'function') {
+            cc.director.loadScene(ftc.localLaunchScene || 'original/SceneMain');
+        } else if (ftc.scene && typeof ftc.scene.loading === 'function') {
+            window.setTimeout(function () { ftc.scene.loading(); }, 0);
+        }
+        return true;
+    }
+
+    function createLocalSave() {
+        var player = ftc.player;
+        if (!player || !player.dbHeader || typeof player.dbHeader.createHeader !== 'function') return null;
+        var id = player.dbHeader.createHeader();
+        reloadLocalSave(id);
+        return id;
+    }
+
+    function drawLocalButton(node, text, width, height) {
+        node.setContentSize(width, height);
+        node.active = true;
+        var graphics = node.addComponent(cc.Graphics);
+        graphics.fillColor = cc.color(65, 48, 35, 245);
+        graphics.roundRect(-width / 2, -height / 2, width, height, 8);
+        graphics.fill();
+        var labelNode = new cc.Node('Label_' + text);
+        labelNode.setPosition(cc.v2(0, 0));
+        var label = labelNode.addComponent(cc.Label);
+        label.string = text;
+        label.fontSize = 22;
+        label.lineHeight = height;
+        labelNode.color = cc.color(255, 255, 255, 255);
+        node.addChild(labelNode);
+        node.zIndex = 1;
+        return node;
+    }
+
+    function openLocalSavePanel(layout) {
+        layout.__alloySavePanelClosed = false;
+        var panel = new cc.Node('OfflineSavePanel');
+        panel.setContentSize(620, 470);
+        panel.setPosition(cc.v2(568, 320));
+        panel.zIndex = 1000;
+        var background = panel.addComponent(cc.Graphics);
+        background.fillColor = cc.color(28, 24, 20, 248);
+        background.roundRect(-310, -235, 620, 470, 14);
+        background.fill();
+        if (cc.BlockInputEvents) panel.addComponent(cc.BlockInputEvents);
+        var titleNode = new cc.Node('OfflineSaveTitle');
+        var title = titleNode.addComponent(cc.Label);
+        title.string = '离线存档';
+        title.fontSize = 30;
+        title.lineHeight = 42;
+        titleNode.setPosition(cc.v2(0, 190));
+        panel.addChild(titleNode);
+        localSaveSlots().forEach(function (slot, index) {
+            var button = drawLocalButton(new cc.Node('OfflineSaveSlot' + slot.index), '存档' + slot.index + (slot.selected ? '（当前）' : ''), 380, 46);
+            button.setPosition(cc.v2(0, 125 - index * 58));
+            button.on(cc.Node.EventType.TOUCH_END, function () {
+                if (reloadLocalSave(slot.id)) { layout.__alloySavePanel = null; layout.__alloySavePanelClosed = true; panel.removeFromParent(); }
+            });
+            panel.addChild(button);
+        });
+        var create = drawLocalButton(new cc.Node('OfflineSaveCreate'), '新建存档', 180, 44);
+        create.setPosition(cc.v2(-105, -190));
+        create.on(cc.Node.EventType.TOUCH_END, function () { createLocalSave(); layout.__alloySavePanel = null; layout.__alloySavePanelClosed = true; panel.removeFromParent(); });
+        panel.addChild(create);
+        var close = drawLocalButton(new cc.Node('OfflineSaveClose'), '关闭', 180, 44);
+        close.setPosition(cc.v2(105, -190));
+        close.on(cc.Node.EventType.TOUCH_END, function () { layout.__alloySavePanel = null; layout.__alloySavePanelClosed = true; panel.removeFromParent(); });
+        panel.addChild(close);
+        layout.node.addChild(panel);
+        layout.__alloySavePanel = panel;
+    }
+
+    function findLocalNode(root, name) {
+        if (!root) return null;
+        if (root.name === name) return root;
+        var children = root.children || [];
+        for (var index = 0; index < children.length; index += 1) {
+            var result = findLocalNode(children[index], name);
+            if (result) return result;
+        }
+        return null;
+    }
+
+    function setLocalButtonText(root, text) {
+        if (!root) return false;
+        var changed = false;
+        var label = root.getComponent && root.getComponent(cc.Label);
+        if (label) { label.string = text; changed = true; }
+        var children = root.children || [];
+        for (var index = 0; index < children.length; index += 1) changed = setLocalButtonText(children[index], text) || changed;
+        return changed;
+    }
+
+    function ensureLocalSaveSwitcher(layout) {
+        var layoutName = layout && (layout._layoutName || layout.name || (layout.node && layout.node.name));
+        if (!layout || !layout.node || layoutName !== 'LayoutPlayerInfo' || layout.node.__alloySaveButton) return;
+        var button = layout.buttonSave && layout.buttonSave.node;
+        if (!button) button = findLocalNode(layout.node, 'ButtonSave');
+        if (!button) return;
+        button.name = 'ButtonSaveOffline';
+        setLocalButtonText(button, '存档');
+        console.log('[ALLOY2581_SAVE_BUTTON] layout=' + layoutName + ' node=' + button.name);
+        var openFromSave = function (event) {
+            if (event && event.stopPropagationImmediate) event.stopPropagationImmediate();
+            else if (event && event.stopPropagation) event.stopPropagation();
+            if (event && event.type === cc.Node.EventType.TOUCH_END) openLocalSavePanel(layout);
+        };
+        button.on(cc.Node.EventType.TOUCH_START, openFromSave, null, true);
+        button.on(cc.Node.EventType.TOUCH_END, openFromSave, null, true);
+        button.__alloySaveTouchHook = true;
+        layout.__alloySaveButton = button;
+        layout.node.__alloySaveButton = button;
+    }
+
+     window.Alloy2581Local = {
         httpConnect: function (method, url, body, callback) {
             if (typeof callback !== 'function') throw new TypeError('A transport callback is required');
             window.setTimeout(function () { callback(false, 'Independent-local remote transport is not configured'); }, 0);
+            return false;
+        },
+        listSaveSlots: localSaveSlots,
+        switchSaveSlot: reloadLocalSave,
+        createSaveSlot: createLocalSave,
+        ensureSaveSwitcher: ensureLocalSaveSwitcher,
+        openSavePanel: function () {
+            var layout = ftc.ManagerRes.findLayout && ftc.ManagerRes.findLayout('LayoutPlayerInfo');
+            if (!layout && ftc.ManagerRes.topLayout) layout = ftc.ManagerRes.topLayout();
+            if (!layout) return false;
+            openLocalSavePanel(layout);
         },
         installLocalMode: function (context) {
             if (installed) throw new Error('The independent-local lifecycle can only be installed once');
@@ -241,6 +508,7 @@
             var Scene = cc.js.getClassByName('SceneMain');
             if (!Scene) throw new Error('The original SceneMain class is not registered');
             var storage = cc.sys.localStorage;
+            context.ftc.localLaunchScene = context.settings && context.settings.launchScene;
             // Independent release rules: disable original TEST-gated UI, commands and bypasses without impersonating an SDK source.
             // The original DbFile TEST branches only log; this does not change the selected slot or save encoding.
             context.fts.TEST = false;
@@ -250,6 +518,8 @@
             // Original getUserCenter uses this capability flag; an independent host has no account/SDK center.
             // Close it before any original UI reads passport.account, without inventing an authenticated passport.
             context.ftc.openUserCenter = false;
+            // No delegating network links to external browser/apps in the offline host.
+            cc.sys.openURL = function () { context.ftc.showTip('离线版不打开网络链接。'); return false; };
             context.ftc.localMode = {mode: 'independent-local', profile: 'local-production', authenticated: false, remote: 'not-configured'};
             // Preserve the original top-UI resource construction; exclude the separate commercial certification initializer.
             window.ftr.init = function (ready) {

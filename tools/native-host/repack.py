@@ -7,9 +7,10 @@ import struct
 import subprocess
 import sys
 import uuid
+import xml.etree.ElementTree as ET
 import zipfile
 
-from probe import PROJECT, WORKSPACE, BUILD_TOOLS, JDK, ENGINES, runtime_asset_compression
+from probe import PROJECT, WORKSPACE, BUILD_TOOLS, JDK, ENGINES, SDK, ANDROID, runtime_asset_compression
 
 
 def copy_runtime_entry(incoming, raw, outgoing, info):
@@ -47,6 +48,9 @@ def main():
     parser = argparse.ArgumentParser(description='Repack project JS, normalize native audio FD storage, and optionally its rebuilt host in a verified independent development APK; never an original APK or final release.')
     parser.add_argument('build_report', type=Path)
     parser.add_argument('--update-driver', action='store_true', help='Use only the configured, rebuilt independent host library for the existing ABI')
+    parser.add_argument('--debuggable', action='store_true', help='Enable run-as in this development-only test APK; does not enable original game TEST rules')
+    parser.add_argument('--level300', action='store_true', help='Embed an explicitly labelled first-run level-300 test slot; existing slots are retained')
+    parser.add_argument('--full-test', action='store_true', help='Explicit full inventory/local-world QA fixture, separate from existing saves')
     args = parser.parse_args()
     original = json.loads(args.build_report.read_text(encoding='utf-8'))
     if (original['kind'] != 'original-scene-integration-development-NOT-FINAL' or
@@ -58,7 +62,53 @@ def main():
             raise RuntimeError('Development source APK identity mismatch')
     output = WORKSPACE / '05-builds/storm-caravan/native-game-development' / uuid.uuid4().hex[:12]
     output.mkdir(parents=True)
+    commands = []
+
+    def run(arguments):
+        result = subprocess.run([str(value) for value in arguments], cwd=PROJECT, capture_output=True,
+                                text=True, encoding='utf-8', errors='backslashreplace')
+        commands.append({'executable': str(arguments[0]), 'exitCode': result.returncode,
+                         'stdout': result.stdout, 'stderr': result.stderr})
+        (output / 'commands.json').write_text(json.dumps(commands, ensure_ascii=False, indent=2), encoding='utf-8')
+        if result.returncode:
+            raise RuntimeError(result.stderr or result.stdout)
+
     replacements = {'assets/alloy/' + path.name: path for path in (PROJECT / 'native-host/js').glob('*.js')}
+    full_seed_report = None
+    if args.full_test:
+        from test_seed import create_full_seed
+        fixture, full_seed_report = create_full_seed(PROJECT)
+        seed_bootstrap = output / 'bootstrap-full-test.js'
+        seed_bootstrap.write_text('window.Alloy2581FullTestSeed = ' + json.dumps(fixture, ensure_ascii=True) + ';\n' +
+                                  (PROJECT / 'native-host/js/bootstrap.js').read_text(encoding='utf-8'), encoding='utf-8')
+        replacements['assets/alloy/bootstrap.js'] = seed_bootstrap
+    elif args.level300:
+        seed_bootstrap = output / 'bootstrap-level300.js'
+        seed_bootstrap.write_text('window.Alloy2581TestLevel = 300;\n' +
+                                  (PROJECT / 'native-host/js/bootstrap.js').read_text(encoding='utf-8'), encoding='utf-8')
+        replacements['assets/alloy/bootstrap.js'] = seed_bootstrap
+    if args.debuggable or args.level300 or args.full_test:
+        manifest = ET.parse(PROJECT / 'native-host/AndroidManifest.xml')
+        if manifest.getroot().get('package') != original['package']:
+            raise RuntimeError('Development manifest package mismatch')
+        app = manifest.getroot().find('application')
+        app.set(ANDROID + 'debuggable', 'true' if args.debuggable else 'false')
+        if args.full_test:
+            app.set(ANDROID + 'label', '合金机兵2581离线全量测试')
+        elif args.level300:
+            app.set(ANDROID + 'label', '合金机兵2581离线300级测试')
+        if manifest.getroot().find('uses-permission') is not None:
+            raise RuntimeError('Offline test manifest must not request any permissions')
+        manifest_path = output / 'AndroidManifest.xml'
+        ET.register_namespace('android', ANDROID[1:-1])
+        manifest.write(manifest_path, encoding='utf-8', xml_declaration=True)
+        manifest_apk = output / 'debug-manifest.apk'
+        run([BUILD_TOOLS / 'aapt.exe', 'package', '-f', '-M', manifest_path,
+             '-I', SDK / 'platforms/android-36/android.jar', '-F', manifest_apk])
+        with zipfile.ZipFile(manifest_apk) as archive:
+            compiled_manifest = output / 'AndroidManifest.bin'
+            compiled_manifest.write_bytes(archive.read('AndroidManifest.xml'))
+        replacements['AndroidManifest.xml'] = compiled_manifest
     if args.update_driver:
         driver = ENGINES[original['abi']][2]
         if not driver.is_file():
@@ -87,17 +137,6 @@ def main():
             raise RuntimeError('Repacked ZIP CRC verification failed')
         runtime_count = sum(name.startswith('assets/') and not name.startswith('assets/third-party-licenses/')
                             for name in archive.namelist())
-    commands = []
-
-    def run(arguments):
-        result = subprocess.run([str(value) for value in arguments], cwd=PROJECT, capture_output=True,
-                                text=True, encoding='utf-8', errors='backslashreplace')
-        commands.append({'executable': str(arguments[0]), 'exitCode': result.returncode,
-                         'stdout': result.stdout, 'stderr': result.stderr})
-        (output / 'commands.json').write_text(json.dumps(commands, ensure_ascii=False, indent=2), encoding='utf-8')
-        if result.returncode:
-            raise RuntimeError(result.stderr or result.stdout)
-
     aligned = output / 'host-aligned.apk'
     run([BUILD_TOOLS / 'zipalign.exe', '-f', '-p', '4', unsigned, aligned])
     target = output / f'alloy2581-native-game-development-{original["abi"]}.apk'
@@ -111,6 +150,8 @@ def main():
                   replacedProjectScripts={name: value for name, value in hashes.items() if name.startswith('assets/alloy/')},
                   driverSHA256=hashes.get(f'lib/{original["abi"]}/liballoy2581.so', original['driverSHA256']),
                   independentDriverUpdated=args.update_driver, runtimeAssets=runtime_count,
+                  debuggable=args.debuggable if args.level300 else args.debuggable or original.get("debuggable", False),
+                  testSeedLevel=300 if args.level300 or args.full_test else None, fullTestSeed=full_seed_report,
                   deviceRun='not-yet-verified', resourceCompressedBytesReused=not audio_repairs,
                   unchangedNonAudioCompressedBytesReused=True, nativeAudioStorageRepairs=len(audio_repairs))
     report.pop('audioStorageRepairReport', None)
